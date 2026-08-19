@@ -65,25 +65,65 @@ def _collect_signal_names(node, names, kind):
 
 
 def check_rtl(code: str) -> CheckResult:
-    result = CheckResult()
-    path = _write_temp_verilog(code)
+    """
+    Analyzes every module found in the pasted source. If more than one
+    module is present, per-issue messages are prefixed with the owning
+    module's name so findings from a multi-module file aren't ambiguous.
+    """
+    if not code or not code.strip():
+        result = CheckResult()
+        result.issues.append(Issue("error", "EMPTY_INPUT", "No RTL provided — paste some Verilog first."))
+        return result
 
+    path = _write_temp_verilog(code)
     try:
         ast, _ = parse([path])
     except Exception as e:
+        result = CheckResult()
         result.issues.append(Issue("error", "SYNTAX", f"Parse failed: {e}"))
-        os.unlink(path)
         return result
     finally:
         if os.path.exists(path):
             os.unlink(path)
 
-    modules = [d for d in ast.description.definitions if isinstance(d, ModuleDef)]
+    try:
+        modules = [d for d in ast.description.definitions if isinstance(d, ModuleDef)]
+    except Exception as e:
+        result = CheckResult()
+        result.issues.append(Issue("error", "INTERNAL_ERROR", f"Could not walk parsed AST: {e}"))
+        return result
+
     if not modules:
+        result = CheckResult()
         result.issues.append(Issue("error", "NO_MODULE", "No module definition found."))
         return result
 
-    mod = modules[0]
+    multi = len(modules) > 1
+    combined = CheckResult()
+    combined.module_name = ", ".join(m.name for m in modules) if multi else modules[0].name
+
+    for mod in modules:
+        try:
+            single = _check_single_module(mod)
+        except Exception as e:
+            single = CheckResult(module_name=mod.name)
+            single.issues.append(Issue(
+                "error", "INTERNAL_ERROR",
+                f"Analysis crashed on module '{mod.name}': {e}"
+            ))
+        prefix = f"[{mod.name}] " if multi else ""
+        for issue in single.issues:
+            issue.message = prefix + issue.message
+            combined.issues.append(issue)
+        if not multi:
+            combined.ports = single.ports
+
+    combined.passed = combined.error_count == 0
+    return combined
+
+
+def _check_single_module(mod) -> CheckResult:
+    result = CheckResult()
     result.module_name = mod.name
 
     # --- ports ---
@@ -209,16 +249,36 @@ def check_rtl(code: str) -> CheckResult:
     return result
 
 
+def _node_to_str(node) -> str:
+    """Best-effort rendering of a width expression node back to source-like text."""
+    if node is None:
+        return "?"
+    value = getattr(node, "value", None)
+    if value is not None:
+        return str(value)
+    name = getattr(node, "name", None)
+    if name is not None:
+        return str(name)
+    # binary op nodes (Minus, Plus, etc.) expose .left / .right
+    left = getattr(node, "left", None)
+    right = getattr(node, "right", None)
+    op = type(node).__name__
+    if left is not None and right is not None:
+        sym = {"Minus": "-", "Plus": "+", "Times": "*"}.get(op, op)
+        return f"{_node_to_str(left)}{sym}{_node_to_str(right)}"
+    return "expr"
+
+
 def _width_str(decl_item) -> str:
     w = getattr(decl_item, "width", None)
     if w is None:
         return "1"
     try:
-        msb = getattr(w.msb, "value", "?")
-        lsb = getattr(w.lsb, "value", "?")
+        msb = _node_to_str(w.msb)
+        lsb = _node_to_str(w.lsb)
         return f"[{msb}:{lsb}]"
     except Exception:
-        return "?"
+        return "[parameterized]"
 
 
 def _lhs_name(node):
