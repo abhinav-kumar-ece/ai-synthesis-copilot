@@ -38,6 +38,10 @@ def yosys_available() -> bool:
 def run_synthesis(code: str, top_module: str = "") -> SynthResult:
     result = SynthResult()
 
+    if not code or not code.strip():
+        result.errors.append("No RTL provided — nothing to synthesize.")
+        return result
+
     if not yosys_available():
         result.tool_missing = True
         result.errors.append(
@@ -68,7 +72,14 @@ def run_synthesis(code: str, top_module: str = "") -> SynthResult:
                 capture_output=True, text=True, timeout=30, cwd=tmpdir,
             )
         except subprocess.TimeoutExpired:
-            result.errors.append("Synthesis timed out (30s limit).")
+            result.errors.append("Synthesis timed out (30s limit) — design may be too large or have an infinite elaboration loop.")
+            return result
+        except FileNotFoundError:
+            result.tool_missing = True
+            result.errors.append("Yosys binary not found when trying to run it.")
+            return result
+        except Exception as e:
+            result.errors.append(f"Synthesis process failed unexpectedly: {e}")
             return result
 
         result.ran = True
